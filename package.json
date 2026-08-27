@@ -1,0 +1,14 @@
+{
+  "name": "clone-website-skill",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Claude Code skill: mirror any public website to a local offline copy, including JS-rendered SPAs.",
+  "scripts": {
+    "clone": "node scripts/clone.mjs",
+    "postinstall": "playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.40.0"
+  }
+}
