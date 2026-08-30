@@ -37,15 +37,26 @@ This skill runs two engines and picks between them automatically:
 | `render` | Chromium via Playwright | client-rendered SPAs, lazy-loaded media, runtime-fetched assets |
 
 `--engine auto` (default) fetches the raw HTML, renders the same page, and
-compares visible text length. More text after rendering means the crawl
-switches to the browser engine.
+compares two signals:
+
+1. **Visible text growth.** Much more text after rendering means the markup was
+   a shell -> `render`.
+2. **Scripts the markup never declares.** Modern bundlers code-split, and a
+   module loader pulls the chunks in at runtime. Static mode can only fetch
+   what the HTML names, so those chunks are lost. Five or more undeclared
+   scripts -> `render`.
+
+The second signal exists because the first one isn't sufficient. A
+server-rendered page can score ~1.1x on text and still clone into something
+broken: `attio.com` ships its hero as `style="opacity:0"` and fades it in from
+a runtime-loaded chunk. Static mode saved the text, missed 35 of 71 scripts,
+and the copy opened with a correct navbar above an entirely blank page. The
+detector now catches that case.
 
 The render engine intercepts **every network response the page makes** and
-writes it to disk. That's what catches webfonts, lazy images, and XHR payloads
-that never appear as an attribute in the source HTML. On a test of
-`https://react.dev` the render engine captured 118 assets with 0 failures,
-against 20 failures in static mode — the browser sends the right headers and
-referer, so origins that reject bare fetches serve normally.
+writes it to disk — webfonts, lazy images, code-split chunks, XHR payloads.
+Cloning 20 pages of `attio.com` it saved 744 assets with **0 failures**, and
+the result renders indistinguishably from the live site.
 
 ## Options
 
@@ -128,6 +139,11 @@ later doesn't re-download what you already have.
 - **Auth, carts, personalisation** — server-side session state
 - **Analytics and cookie consent** — frequently domain-locked
 - **Streamed video** — HLS/DASH manifests point back at origin CDNs
+- **URLs inside framework payloads** — a page's own JSON blob (Next's RSC
+  stream, `__NEXT_DATA__`) is left untouched, because rewriting a URL inside a
+  JSON string literal corrupts the script. Anything the client re-requests from
+  that payload will 404 offline. What the markup declares is already local, so
+  this shows up as a handful of duplicate image requests, not missing content
 
 ## Before you republish
 

@@ -12,7 +12,7 @@
  * against the raw HTML to decide which to use for the whole crawl.
  */
 import fs from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 
 // ---------------------------------------------------------------- arguments
@@ -66,18 +66,40 @@ function pageFile(u) {
   if (!/\.[a-z0-9]{2,5}$/i.test(last)) parts[parts.length - 1] = last + '.html';
   return path.join(OPTS.out, ...parts);
 }
-function assetFile(u) {
+function assetFile(u, ct) {
   const url = new URL(u);
   const parts = sanitize(url.pathname);
   if (!parts.length) parts.push('index');
+  const i = parts.length - 1;
+  // An extensionless path needs one, or the static server serves it as
+  // octet-stream. Content-Type wins over the URL: Next's optimizer re-encodes,
+  // so `...url=logo.webp` can come back as JPEG.
+  const ext = /\.[a-z0-9]{2,5}$/i.test(parts[i])
+    ? ''
+    : (extFromCT(ct) ?? assetExtOf(u) ?? '');
   // keep query-distinguished assets apart without breaking the extension
   if (url.search) {
     const h = [...url.search].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7).toString(36);
-    const i = parts.length - 1;
     const m = parts[i].match(/^(.*?)(\.[a-z0-9]{2,5})$/i);
-    parts[i] = m ? `${m[1]}.${h}${m[2]}` : `${parts[i]}.${h}`;
+    parts[i] = m ? `${m[1]}.${h}${m[2]}` : `${parts[i]}.${h}${ext}`;
+  } else {
+    parts[i] += ext;
   }
   return path.join(OPTS.out, ASSET_DIR, url.hostname, ...parts);
+}
+
+/** Resume: the extension depends on a response we haven't made yet, so match on stem. */
+function existingAsset(u) {
+  const guess = assetFile(u);
+  if (existsSync(guess)) return guess;
+  const dir = path.dirname(guess);
+  const stem = path.basename(guess).replace(/\.[a-z0-9]{2,5}$/i, '');
+  try {
+    for (const f of readdirSync(dir)) {
+      if (f === stem || f.startsWith(stem + '.')) return path.join(dir, f);
+    }
+  } catch { /* directory not created yet */ }
+  return null;
 }
 const relFrom = (from, to) => path.relative(path.dirname(from), to).split(path.sep).join('/');
 const write = async (f, buf) => {
@@ -92,8 +114,54 @@ const stats = { pages: 0, assets: 0, reused: 0, failed: 0, bytes: 0 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const ASSET_EXT = /\.(css|js|mjs|png|jpe?g|gif|svg|webp|avif|ico|bmp|woff2?|ttf|otf|eot|mp4|webm|ogg|mp3|wav|pdf|json|xml|txt)$/i;
+
+const ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", '#39': "'", '#x27': "'", nbsp: ' ' };
+/** Attribute values arrive HTML-escaped; `&amp;w=256` is a parameter named "amp;w". */
+const decodeEntities = (s) =>
+  s.replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (m, e) => {
+    const k = e.toLowerCase();
+    if (ENTITIES[k] !== undefined) return ENTITIES[k];
+    if (k[0] === '#') {
+      const n = k[1] === 'x' ? parseInt(k.slice(2), 16) : parseInt(k.slice(1), 10);
+      return Number.isFinite(n) ? String.fromCodePoint(n) : m;
+    }
+    return m;
+  });
+
+/**
+ * Image CDNs serve assets from extensionless paths and name the real file in a
+ * query parameter -- Next.js `/_next/image?url=...%2Flogo.png&w=256`. Look in
+ * both places, and report the extension so the copy lands on disk with a name
+ * the static server can assign a MIME type to.
+ */
+function assetExtOf(u) {
+  try {
+    const x = new URL(u);
+    const inPath = x.pathname.match(ASSET_EXT);
+    if (inPath) return inPath[0];
+    for (const v of x.searchParams.values()) {
+      const m = decodeURIComponent(v).split(/[?#]/)[0].match(ASSET_EXT);
+      if (m) return m[0];
+    }
+  } catch { /* malformed */ }
+  return null;
+}
+const looksLikeAsset = (u) => assetExtOf(u) !== null;
+
+const CT_EXT = {
+  'image/png': '.png', 'image/jpeg': '.jpg', 'image/jpg': '.jpg',
+  'image/webp': '.webp', 'image/avif': '.avif', 'image/gif': '.gif',
+  'image/svg+xml': '.svg', 'image/x-icon': '.ico', 'image/vnd.microsoft.icon': '.ico',
+  'text/css': '.css', 'text/javascript': '.js', 'application/javascript': '.js',
+  'application/json': '.json', 'font/woff2': '.woff2', 'font/woff': '.woff',
+  'font/ttf': '.ttf', 'font/otf': '.otf', 'application/pdf': '.pdf',
+  'video/mp4': '.mp4', 'video/webm': '.webm', 'audio/mpeg': '.mp3',
+};
+const extFromCT = (ct) =>
+  ct ? (CT_EXT[ct.split(';')[0].trim().toLowerCase()] ?? null) : null;
+
 const isPage = (u) => {
-  try { const x = new URL(u); return x.origin === ORIGIN && !ASSET_EXT.test(x.pathname); }
+  try { const x = new URL(u); return x.origin === ORIGIN && !looksLikeAsset(u); }
   catch { return false; }
 };
 const allowedPath = (p) =>
@@ -165,10 +233,10 @@ function linksFrom(html, base) {
 }
 
 // ------------------------------------------------------------------ assets
-async function saveAsset(url, buf) {
+async function saveAsset(url, buf, ct) {
   if (assetMap.has(url)) return assetMap.get(url);
   if (buf.length > OPTS.maxAsset) { assetMap.set(url, null); return null; }
-  const f = assetFile(url);
+  const f = assetFile(url, ct);
   await write(f, buf);
   assetMap.set(url, f);
   stats.assets++;
@@ -177,12 +245,14 @@ async function saveAsset(url, buf) {
 }
 async function fetchAsset(url) {
   if (assetMap.has(url)) return assetMap.get(url);
-  const f = assetFile(url);
-  if (OPTS.resume && existsSync(f)) { assetMap.set(url, f); stats.reused++; return f; }
+  if (OPTS.resume) {
+    const hit = existingAsset(url);
+    if (hit) { assetMap.set(url, hit); stats.reused++; return hit; }
+  }
   try {
     const r = await fetch(url, { headers: { 'User-Agent': UA, Referer: ORIGIN } });
     if (!r.ok) throw new Error('HTTP ' + r.status);
-    return await saveAsset(url, Buffer.from(await r.arrayBuffer()));
+    return await saveAsset(url, Buffer.from(await r.arrayBuffer()), r.headers.get('content-type'));
   } catch {
     stats.failed++;
     assetMap.set(url, null);
@@ -194,13 +264,29 @@ async function fetchAsset(url) {
 const ATTR = /\b(src|href|poster|data-src|data-srcset|srcset)\s*=\s*(["'])(.*?)\2/gis;
 const CSSURL = /url\(\s*(['"]?)([^'")]+)\1\s*\)/gi;
 
+const SCRIPT_BLOCK = /<script[^>]*>[\s\S]*?<\/script>/gi;
+
+/**
+ * Apply `fn` to markup only, leaving <script> bodies untouched. Framework
+ * payloads (Next's RSC stream, __NEXT_DATA__) sit in those blocks as JSON
+ * string literals; substituting a URL that carries a quote corrupts the script.
+ */
+function outsideScripts(html, fn) {
+  let out = '', last = 0;
+  for (const m of html.matchAll(SCRIPT_BLOCK)) {
+    out += fn(html.slice(last, m.index)) + m[0];
+    last = m.index + m[0].length;
+  }
+  return out + fn(html.slice(last));
+}
+
 async function collectAndRewrite(html, pageUrl, { fetchMissing }) {
   const jobs = [];
   const resolve = (raw) => {
-    try { return new URL(raw.trim(), pageUrl).href.split('#')[0]; } catch { return null; }
+    try { return new URL(decodeEntities(raw.trim()), pageUrl).href.split('#')[0]; } catch { return null; }
   };
 
-  let out = html.replace(ATTR, (full, attr, q, val) => {
+  let out = outsideScripts(html, (chunk) => chunk.replace(ATTR, (full, attr, q, val) => {
     const a = attr.toLowerCase();
     if (a === 'srcset' || a === 'data-srcset') {
       const parts = val.split(',').map((s) => {
@@ -215,18 +301,19 @@ async function collectAndRewrite(html, pageUrl, { fetchMissing }) {
     if (/^(data:|mailto:|tel:|javascript:|#)/i.test(val)) return full;
     const abs = resolve(val);
     if (!abs) return full;
-    if (ASSET_EXT.test(new URL(abs).pathname)) { jobs.push(abs); return `${attr}=${q}${mark(abs)}${q}`; }
+    if (looksLikeAsset(abs)) { jobs.push(abs); return `${attr}=${q}${mark(abs)}${q}`; }
     if (isPage(abs)) return `${attr}=${q}${mark(abs)}${q}`;  // resolved in pass 2
     return `${attr}=${q}${abs}${q}`;                          // offsite: leave absolute
-  });
+  }));
 
-  out = out.replace(CSSURL, (full, q, val) => {
+  out = outsideScripts(out, (chunk) => chunk.replace(CSSURL, (full, q, val) => {
     if (val.startsWith('data:')) return full;
     const abs = resolve(val);
     if (!abs) return full;
     jobs.push(abs);
-    return `url("${mark(abs)}")`;
-  });
+    // keep the author's quoting: emitting `"` inside style="..." ends the attribute
+    return `url(${q}${mark(abs)}${q})`;
+  }));
 
   if (fetchMissing) {
     for (let i = 0; i < jobs.length; i += 6) {
@@ -300,10 +387,15 @@ async function initBrowser() {
 }
 
 /** Render a page, saving every response the browser makes along the way. */
-async function fetchRendered(url) {
+async function fetchRendered(url, seenScripts) {
   if (!(await initBrowser())) return await fetchStatic(url);
   const page = await context.newPage();
   const pending = [];
+  if (seenScripts) {
+    page.on('request', (req) => {
+      if (req.resourceType() === 'script') seenScripts.add(req.url().split('#')[0]);
+    });
+  }
   page.on('response', (res) => {
     const u = res.url().split('#')[0];
     if (!/^https?:/.test(u)) return;
@@ -312,7 +404,7 @@ async function fetchRendered(url) {
     try { pathname = new URL(u).pathname; } catch { return; }
     if (!ASSET_EXT.test(pathname) && !/(css|javascript|font|image)/i.test(ct)) return;
     if (assetMap.has(u)) return;
-    pending.push(res.body().then((b) => saveAsset(u, b)).catch(() => {}));
+    pending.push(res.body().then((b) => saveAsset(u, b, ct)).catch(() => {}));
   });
 
   try {
@@ -358,11 +450,30 @@ async function decideEngine() {
   }
 
   let rendered = '';
-  try { rendered = await fetchRendered(START.href); } catch { return 'static'; }
+  const runtimeScripts = new Set();
+  try { rendered = await fetchRendered(START.href, runtimeScripts); } catch { return 'static'; }
   const renLen = visibleLen(rendered);
   const ratio = renLen / Math.max(rawLen, 1);
-  console.log(`  probe: static ${rawLen} vs rendered ${renLen} chars (x${ratio.toFixed(2)})`);
-  return ratio > 1.5 ? 'render' : 'static';
+
+  // Scripts the HTML never names -- code-split chunks pulled in by a module
+  // loader at runtime. A server-rendered page reads fine without them but
+  // arrives inert: entrance animations that start at opacity:0 never run, so
+  // the copy looks blank. Static mode can only fetch what the markup declares.
+  const declared = new Set(
+    [...raw.matchAll(/<script[^>]*src\s*=\s*["']([^"']+)["']/gi)]
+      .map((m) => { try { return new URL(m[1], START.href).href; } catch { return m[1]; } }),
+  );
+  const undeclared = [...runtimeScripts].filter((u) => !declared.has(u)).length;
+
+  console.log(`  probe: static ${rawLen} vs rendered ${renLen} chars (x${ratio.toFixed(2)}), `
+    + `${undeclared} runtime-loaded script${undeclared === 1 ? '' : 's'}`);
+
+  if (ratio > 1.5) return 'render';
+  if (undeclared >= 5) {
+    console.log(`  -> render (markup declares ${declared.size} scripts, the page loads ${runtimeScripts.size})`);
+    return 'render';
+  }
+  return 'static';
 }
 
 // -------------------------------------------------------------------- main
