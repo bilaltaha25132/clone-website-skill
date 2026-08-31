@@ -192,11 +192,12 @@ later doesn't re-download what you already have.
 - **Error reporting** - Sentry and friends POST to an ingest endpoint; those
   requests fail harmlessly
 
-A clone is a sample, so links will point at pages outside it. Rather than
-dead-ending on a 404, `serve.mjs` redirects any path it does not hold to the
-live site — navigation keeps working, and it is obvious which pages are local.
-That does mean the copy reaches the network for those; `--pages` higher, or
-`--all`, shrinks the gap.
+A clone is a sample, so links will point at pages outside it. `serve.mjs`
+answers those with a local page naming the path and listing every page the copy
+does hold, so you land somewhere useful and can carry on clicking. It never
+redirects to the original site: a copy that silently hands you back to the
+live site has stopped being a copy, and offline it would simply fail. Raise
+`--pages`, or use `--all`, to close the gap.
 - **Streamed video** — HLS/DASH manifests point back at origin CDNs
 - **URLs inside framework payloads** — a page's own JSON blob (Next's RSC
   stream, `__NEXT_DATA__`) is left untouched, because rewriting a URL inside a

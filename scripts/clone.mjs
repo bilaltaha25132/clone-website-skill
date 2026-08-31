@@ -137,6 +137,7 @@ const pageMap = new Map();   // absolute page url -> local file
 const pageFiles = new Set(); // local page files, kept relative so the folder can move
 const urlManifest = {};      // original "/path?query" -> local file, for serve.mjs
 const renderedLinks = new Map(); // page url -> links present only after JS runs
+const pageIndex = {};        // url pathname -> local file, for the offline fallback
 const assetMap = new Map();  // absolute asset url -> local file (null = failed)
 const stats = { pages: 0, assets: 0, reused: 0, failed: 0, bytes: 0 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -600,13 +601,13 @@ async function main() {
     pageFiles.add(outFile);
 
     if (OPTS.resume && existsSync(outFile)) {
+      pageIndex[new URL(url).pathname] = path.relative(OPTS.out, outFile).split(path.sep).join('/');
       stats.pages++;
       console.log(`  [${String(stats.pages).padStart(3)}] reuse  ${p}`);
-      if (d < OPTS.depth) {
-        for (const l of linksFrom(await fs.readFile(outFile, 'utf8'), url)) {
-          if (!queued.has(l)) { queued.add(l); frontier.push({ url: l, d: d + 1 }); }
-        }
-      }
+      // No link extraction here. A cached page has already been rewritten, so
+      // its hrefs are local paths; resolving `apps.html` against the origin
+      // invents https://origin/apps.html, which was never a real URL. A resumed
+      // run discovers through the sitemap and through pages it actually fetches.
       continue;
     }
 
@@ -616,6 +617,7 @@ async function main() {
 
     const rewritten = await collectAndRewrite(html, url, { fetchMissing: engine !== 'render' });
     await write(outFile, rewritten);
+    pageIndex[new URL(url).pathname] = path.relative(OPTS.out, outFile).split(path.sep).join('/');
     stats.pages++;
     console.log(`  [${String(stats.pages).padStart(3)}] ${engine === 'render' ? 'render' : 'fetch '} ${p}  (${(stats.bytes / 1048576).toFixed(0)} MB)`);
 
@@ -650,6 +652,7 @@ async function main() {
   await write(path.join(OPTS.out, MANIFEST), Buffer.from(JSON.stringify({
     origin: ORIGIN,
     urls: urlManifest,
+    pages: pageIndex,
   })));
 
   console.log('\n' + '='.repeat(64));

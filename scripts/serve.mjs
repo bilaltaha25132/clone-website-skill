@@ -36,6 +36,51 @@ function within(root, rel) {
 
 const isFile = (p) => { try { return statSync(p).isFile(); } catch { return false; } };
 
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+
+/** Shown for a path this copy does not hold. Entirely local, no outbound links. */
+function missingPage(pathname, pages, origin) {
+  const list = Object.keys(pages).sort();
+  const items = list.length
+    ? `<ul>${list.map((p) => `<li><a href="${esc(p)}">${esc(p)}</a></li>`).join('')}</ul>`
+    : '<p class="dim">This copy records no page index.</p>';
+  return `<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Not in this copy - ${esc(pathname)}</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin:0; padding:3rem 1.5rem; font:15px/1.6 ui-sans-serif,system-ui,sans-serif;
+         background:#fbfbfa; color:#1a1a1a; }
+  main { max-width:44rem; margin:0 auto; }
+  code { background:#0000000d; padding:.15em .4em; border-radius:4px; font-size:.92em; }
+  h1 { font-size:1.35rem; margin:0 0 .6rem; letter-spacing:-.01em; }
+  p { margin:.5rem 0 1.4rem; }
+  .dim { color:#6b6b6b; }
+  ul { columns:2; gap:2rem; list-style:none; padding:0; margin:0; }
+  li { break-inside:avoid; margin:.18rem 0; }
+  a { color:#2f5fd0; text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  hr { border:0; border-top:1px solid #0000001a; margin:2rem 0 1.4rem; }
+  @media (prefers-color-scheme: dark) {
+    body { background:#141414; color:#e8e8e8; }
+    code { background:#ffffff14; }
+    .dim { color:#9a9a9a; }
+    a { color:#8ab4ff; }
+    hr { border-top-color:#ffffff1f; }
+  }
+</style>
+<main>
+  <h1>Not in this copy</h1>
+  <p><code>${esc(pathname)}</code> exists on ${esc(origin ?? 'the original site')},
+     but was not part of this clone. Re-run with a higher <code>--pages</code>,
+     or <code>--all</code>, to include it.</p>
+  <hr>
+  <p class="dim">${list.length} page${list.length === 1 ? '' : 's'} in this copy:</p>
+  ${items}
+</main>`;
+}
+
 function locate(root, manifest, pathname, search) {
   const exact = manifest[pathname + search];               // query-addressed
   if (exact) return within(root, exact);
@@ -56,24 +101,25 @@ function locate(root, manifest, pathname, search) {
  */
 export async function startServer(dir, port = DEFAULT_PORT) {
   const root = path.resolve(dir);
-  let manifest = {}, origin = null;
+  let manifest = {}, origin = null, pages = {};
   const mf = path.join(root, '_clone-manifest.json');
   if (existsSync(mf)) {
     const raw = JSON.parse(await fs.readFile(mf, 'utf8'));
-    // { origin, urls } since the origin was added; older clones are a bare map
+    // { origin, urls, pages } since those were added; older clones are a bare map
     manifest = raw.urls ?? raw;
     origin = raw.origin ?? null;
+    pages = raw.pages ?? {};
   }
 
   const server = http.createServer((req, res) => {
     const u = new URL(req.url, 'http://localhost');
     const file = locate(root, manifest, u.pathname === '/' ? '/index.html' : u.pathname, u.search);
     if (!file) {
-      // Outside the crawl budget. Send the visitor to the real page rather
-      // than dead-ending: a clone is a sample of a site, not all of it.
-      if (origin) {
-        res.writeHead(302, { location: origin + u.pathname + u.search });
-        return res.end();
+      // Outside the crawl budget. Stay local and say so -- never bounce the
+      // visitor onto the live site, which would quietly stop being a clone.
+      if (req.headers.accept?.includes('text/html')) {
+        res.writeHead(404, { 'content-type': 'text/html; charset=utf-8' });
+        return res.end(missingPage(u.pathname, pages, origin));
       }
       res.writeHead(404, { 'content-type': 'text/plain' });
       return res.end('404 ' + u.pathname + u.search);
