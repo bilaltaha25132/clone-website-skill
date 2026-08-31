@@ -136,6 +136,7 @@ const write = async (f, buf) => {
 const pageMap = new Map();   // absolute page url -> local file
 const pageFiles = new Set(); // local page files, kept relative so the folder can move
 const urlManifest = {};      // original "/path?query" -> local file, for serve.mjs
+const renderedLinks = new Map(); // page url -> links present only after JS runs
 const assetMap = new Map();  // absolute asset url -> local file (null = failed)
 const stats = { pages: 0, assets: 0, reused: 0, failed: 0, bytes: 0 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -187,6 +188,7 @@ const CT_EXT = {
 const extFromCT = (ct) =>
   ct ? (CT_EXT[ct.split(';')[0].trim().toLowerCase()] ?? null) : null;
 
+const isPageSafe = (u) => { try { return isPage(u.split('#')[0]); } catch { return false; } };
 const isPage = (u) => {
   try { const x = new URL(u); return x.origin === ORIGIN && !looksLikeAsset(u); }
   catch { return false; }
@@ -466,6 +468,15 @@ async function fetchRendered(url, seenScripts) {
   await page.waitForTimeout(600);
 
   const snapshot = await page.content();
+
+  // Navigation is often a client component: its links live in the framework's
+  // payload, not in the server HTML, so a source-only crawl never discovers
+  // them. Read them off the rendered DOM while the page is still open.
+  try {
+    const hrefs = await page.$$eval('a[href]', (as) => as.map((a) => a.href));
+    renderedLinks.set(url, [...new Set(hrefs)].filter(isPageSafe));
+  } catch { /* page may have closed */ }
+
   await Promise.allSettled(pending);
   await page.close();
 
@@ -542,19 +553,48 @@ async function main() {
   const sm = await fromSitemaps();
   if (sm.length) console.log(`  sitemap: ${sm.length} urls\n`);
 
+  // Two queues. `frontier` is a breadth-first walk from the start page, so the
+  // site's own navigation is crawled first; `fill` is everything else the
+  // sitemap knows about, shallowest paths first. With a page budget the old
+  // single queue spent it all on whatever sorted first in the sitemap -- on
+  // attio.com that meant 20 pages of /apps/* while /customers and /pricing,
+  // both linked from the header, were never reached.
+  const depthOf = (u) => { try { return new URL(u).pathname.split('/').filter(Boolean).length; } catch { return 99; } };
   const frontier = [{ url: START.href, d: 0 }];
-  for (const u of sm) frontier.push({ url: u, d: 1 });
-  const queued = new Set(frontier.map((f) => f.url));
+  const fill = sm
+    .filter((u) => u !== START.href)
+    .sort((a, b) => depthOf(a) - depthOf(b) || a.length - b.length)
+    .map((u) => ({ url: u, d: 1 }));
+  // Only tracks what is already in the frontier. Seeding it with the sitemap
+  // would reject every linked page that the sitemap also lists -- which is
+  // most of the navigation -- leaving them stuck in the low-priority fill.
+  const queued = new Set([START.href]);
   const done = new Set();
 
-  while (frontier.length && stats.pages < OPTS.pages) {
-    const { url, d } = frontier.shift();
+  while ((frontier.length || fill.length) && stats.pages < OPTS.pages) {
+    let next;
+    if (frontier.length) {
+      // Shallowest path first, so top-level pages beat deep documentation.
+      let best = 0;
+      for (let i = 1; i < frontier.length; i++) {
+        if (depthOf(frontier[i].url) < depthOf(frontier[best].url)) best = i;
+      }
+      next = frontier.splice(best, 1)[0];
+    } else {
+      next = fill.shift();
+    }
+    const { url, d } = next;
+    if (!url) continue;
     if (done.has(url)) continue;
     done.add(url);
     const p = new URL(url).pathname;
     if (!allowedPath(p) || !robotsOk(url)) continue;
 
+    // Several URLs can name one page -- trailing slash, index, tracking query.
+    // Dedupe on the file they write to, or one page burns several of the budget.
     const outFile = pageFile(url);
+    if (done.has(outFile)) { pageMap.set(url, outFile); continue; }
+    done.add(outFile);
     pageMap.set(url, outFile);
     pageMap.set(url.replace(/\/$/, ''), outFile);
     pageFiles.add(outFile);
@@ -580,7 +620,8 @@ async function main() {
     console.log(`  [${String(stats.pages).padStart(3)}] ${engine === 'render' ? 'render' : 'fetch '} ${p}  (${(stats.bytes / 1048576).toFixed(0)} MB)`);
 
     if (d < OPTS.depth) {
-      for (const l of linksFrom(html, url)) {
+      const found = new Set([...linksFrom(html, url), ...(renderedLinks.get(url) ?? [])]);
+      for (const l of found) {
         if (!queued.has(l) && allowedPath(new URL(l).pathname)) {
           queued.add(l); frontier.push({ url: l, d: d + 1 });
         }
@@ -603,10 +644,13 @@ async function main() {
   if (browser) await browser.close();
 
   const mapped = Object.keys(urlManifest).length;
-  if (mapped) {
-    await write(path.join(OPTS.out, MANIFEST),
-      Buffer.from(JSON.stringify(urlManifest)));
-  }
+  // Always written: it also tells the server where this copy came from, so a
+  // link to a page outside the crawl budget can fall through to the live site
+  // instead of dead-ending on a 404.
+  await write(path.join(OPTS.out, MANIFEST), Buffer.from(JSON.stringify({
+    origin: ORIGIN,
+    urls: urlManifest,
+  })));
 
   console.log('\n' + '='.repeat(64));
   console.log(`pages   ${stats.pages}`);

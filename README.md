@@ -148,8 +148,12 @@ Measured on `attio.com`: 4161 React fiber nodes in the clone against 4168 live.
 
 ## How it works
 
-1. **Discovery** — `robots.txt` → `sitemap.xml` (recursing sitemap indexes) →
-   breadth-first link crawl to `--depth`.
+1. **Discovery** — the site's own navigation first (breadth-first from the start
+   page, shallowest paths first), then `sitemap.xml` as fill. Links are read
+   from the rendered DOM as well as the HTML, because a client-rendered header
+   keeps its links in the framework payload where no HTML parser will find
+   them. With a page budget this is the difference between cloning `/customers`
+   and `/pricing` or spending all twenty pages inside `/help/reference/...`.
 2. **Capture** — each page through the chosen engine. The render engine scrolls
    the page to trigger `IntersectionObserver` lazy-loading before capturing the
    post-JavaScript DOM.
@@ -187,6 +191,12 @@ later doesn't re-download what you already have.
 - **Analytics and cookie consent** — frequently domain-locked
 - **Error reporting** - Sentry and friends POST to an ingest endpoint; those
   requests fail harmlessly
+
+A clone is a sample, so links will point at pages outside it. Rather than
+dead-ending on a 404, `serve.mjs` redirects any path it does not hold to the
+live site — navigation keeps working, and it is obvious which pages are local.
+That does mean the copy reaches the network for those; `--pages` higher, or
+`--all`, shrinks the gap.
 - **Streamed video** — HLS/DASH manifests point back at origin CDNs
 - **URLs inside framework payloads** — a page's own JSON blob (Next's RSC
   stream, `__NEXT_DATA__`) is left untouched, because rewriting a URL inside a

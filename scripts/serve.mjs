@@ -56,14 +56,25 @@ function locate(root, manifest, pathname, search) {
  */
 export async function startServer(dir, port = DEFAULT_PORT) {
   const root = path.resolve(dir);
-  let manifest = {};
+  let manifest = {}, origin = null;
   const mf = path.join(root, '_clone-manifest.json');
-  if (existsSync(mf)) manifest = JSON.parse(await fs.readFile(mf, 'utf8'));
+  if (existsSync(mf)) {
+    const raw = JSON.parse(await fs.readFile(mf, 'utf8'));
+    // { origin, urls } since the origin was added; older clones are a bare map
+    manifest = raw.urls ?? raw;
+    origin = raw.origin ?? null;
+  }
 
   const server = http.createServer((req, res) => {
     const u = new URL(req.url, 'http://localhost');
     const file = locate(root, manifest, u.pathname === '/' ? '/index.html' : u.pathname, u.search);
     if (!file) {
+      // Outside the crawl budget. Send the visitor to the real page rather
+      // than dead-ending: a clone is a sample of a site, not all of it.
+      if (origin) {
+        res.writeHead(302, { location: origin + u.pathname + u.search });
+        return res.end();
+      }
       res.writeHead(404, { 'content-type': 'text/plain' });
       return res.end('404 ' + u.pathname + u.search);
     }
