@@ -14,6 +14,7 @@
 import fs from 'node:fs/promises';
 import { existsSync, readdirSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // ---------------------------------------------------------------- arguments
 const argv = process.argv.slice(2);
@@ -36,6 +37,7 @@ const OPTS = {
   pages: has('all') ? Infinity : Number(flag('pages', 50)),
   depth: Number(flag('depth', 3)),
   engine: String(flag('engine', 'auto')),
+  dom: String(flag('dom', 'auto')),
   delay: Number(flag('delay', 300)),
   include: flag('include', null) ? new RegExp(String(flag('include'))) : null,
   exclude: flag('exclude', null) ? new RegExp(String(flag('exclude'))) : null,
@@ -53,6 +55,7 @@ const mark = (u) => S + u + S;
 
 // ------------------------------------------------------------------- paths
 const ASSET_DIR = '_assets';
+const MANIFEST = '_clone-manifest.json';
 const sanitize = (p) => decodeURIComponent(p)
   .replace(/[<>:"|?*\\]/g, '_')
   .split('/').filter((s) => s && s !== '.' && s !== '..')
@@ -85,7 +88,13 @@ function assetFile(u, ct) {
   } else {
     parts[i] += ext;
   }
-  return path.join(OPTS.out, ASSET_DIR, url.hostname, ...parts);
+  // Same-origin assets keep the origin's own layout. Frameworks resolve their
+  // code-split chunks by original URL: served from _assets/<host>/... the
+  // runtime never matches them, the entry module never executes, and the page
+  // loads every script yet never hydrates. Third-party hosts stay namespaced.
+  return url.origin === ORIGIN
+    ? path.join(OPTS.out, ...parts)
+    : path.join(OPTS.out, ASSET_DIR, url.hostname, ...parts);
 }
 
 /** Resume: the extension depends on a response we haven't made yet, so match on stem. */
@@ -102,6 +111,19 @@ function existingAsset(u) {
   return null;
 }
 const relFrom = (from, to) => path.relative(path.dirname(from), to).split(path.sep).join('/');
+
+/**
+ * Link to a local file. Same-origin assets get a root-relative path, matching
+ * the URL the origin served them from: a framework runtime looks its chunks up
+ * by that literal string, and `_next/...` does not match `/_next/...` even
+ * though both resolve to the same file. Pages and third-party assets stay
+ * relative so the folder can be moved or nested.
+ */
+function linkTo(from, to) {
+  const rel = path.relative(OPTS.out, to).split(path.sep).join('/');
+  const mirrored = !rel.startsWith(ASSET_DIR + '/') && !pageFiles.has(to);
+  return mirrored ? '/' + rel : relFrom(from, to);
+}
 const write = async (f, buf) => {
   await fs.mkdir(path.dirname(f), { recursive: true });
   await fs.writeFile(f, buf);
@@ -109,6 +131,8 @@ const write = async (f, buf) => {
 
 // ------------------------------------------------------------------ state
 const pageMap = new Map();   // absolute page url -> local file
+const pageFiles = new Set(); // local page files, kept relative so the folder can move
+const urlManifest = {};      // original "/path?query" -> local file, for serve.mjs
 const assetMap = new Map();  // absolute asset url -> local file (null = failed)
 const stats = { pages: 0, assets: 0, reused: 0, failed: 0, bytes: 0 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -239,6 +263,16 @@ async function saveAsset(url, buf, ct) {
   const f = assetFile(url, ct);
   await write(f, buf);
   assetMap.set(url, f);
+  try {
+    const x = new URL(url);
+    // A dynamic endpoint varies only by query -- /_next/image?url=..&w=256.
+    // No static server can tell those apart, so record the mapping and let
+    // serve.mjs answer them exactly as the origin did.
+    if (x.origin === ORIGIN && x.search) {
+      urlManifest[x.pathname + x.search] =
+        path.relative(OPTS.out, f).split(path.sep).join('/');
+    }
+  } catch { /* malformed */ }
   stats.assets++;
   stats.bytes += buf.length;
   return f;
@@ -329,7 +363,7 @@ async function resolveMarkers(file) {
   txt = txt.replace(MARKED, (_, abs) => {
     const target =
       pageMap.get(abs) ?? pageMap.get(abs.replace(/\/$/, '')) ?? assetMap.get(abs);
-    return target ? relFrom(file, target) : abs;  // not cloned -> stays live
+    return target ? linkTo(file, target) : abs;  // not cloned -> stays live
   });
   await fs.writeFile(file, txt);
 }
@@ -348,7 +382,7 @@ async function rewriteCss(file, cssUrl) {
   for (let i = 0; i < jobs.length; i += 6) await Promise.all(jobs.slice(i, i + 6).map(fetchAsset));
   await fs.writeFile(file, out.replace(MARKED, (_, abs) => {
     const t = assetMap.get(abs);
-    return t ? relFrom(file, t) : abs;
+    return t ? linkTo(file, t) : abs;
   }));
 }
 
@@ -407,10 +441,15 @@ async function fetchRendered(url, seenScripts) {
     pending.push(res.body().then((b) => saveAsset(u, b, ct)).catch(() => {}));
   });
 
+  let source = '';
   try {
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
+    const nav = await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
+    if (nav) source = await nav.text().catch(() => '');
   } catch {
-    try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 }); } catch { /* keep what loaded */ }
+    try {
+      const nav = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      if (nav) source = await nav.text().catch(() => '');
+    } catch { /* keep what loaded */ }
   }
   // trigger lazy-loading, then let late requests settle
   await page.evaluate(async () => {
@@ -423,10 +462,19 @@ async function fetchRendered(url, seenScripts) {
   }).catch(() => {});
   await page.waitForTimeout(600);
 
-  const html = await page.content();
+  const snapshot = await page.content();
   await Promise.allSettled(pending);
   await page.close();
-  return html;
+
+  // Which HTML to keep. The post-JS snapshot shows content even when scripts
+  // can't run offline, but it is already-hydrated markup: React compares it
+  // against its payload, mismatches, and never attaches -- menus and other
+  // interaction stay dead. When the server's own HTML already carries the
+  // content, keeping that gives a page that hydrates exactly like the live one.
+  const wanted = OPTS.dom === 'auto'
+    ? (visibleLen(source) >= 400 ? 'source' : 'snapshot')
+    : OPTS.dom;
+  return wanted === 'source' && source ? source : snapshot;
 }
 
 async function decideEngine() {
@@ -506,6 +554,7 @@ async function main() {
     const outFile = pageFile(url);
     pageMap.set(url, outFile);
     pageMap.set(url.replace(/\/$/, ''), outFile);
+    pageFiles.add(outFile);
 
     if (OPTS.resume && existsSync(outFile)) {
       stats.pages++;
@@ -550,12 +599,27 @@ async function main() {
 
   if (browser) await browser.close();
 
+  const mapped = Object.keys(urlManifest).length;
+  if (mapped) {
+    await write(path.join(OPTS.out, MANIFEST),
+      Buffer.from(JSON.stringify(urlManifest)));
+  }
+
   console.log('\n' + '='.repeat(64));
   console.log(`pages   ${stats.pages}`);
   console.log(`assets  ${stats.assets} saved, ${stats.reused} reused, ${stats.failed} failed`);
   console.log(`size    ${(stats.bytes / 1048576).toFixed(1)} MB`);
   console.log(`output  ${OPTS.out}`);
-  console.log(`\nserve it:  cd "${OPTS.out}" && python -m http.server 8000`);
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  if (mapped) {
+    console.log(`
+  serve it:  node "${path.join(here, 'serve.mjs')}" "${OPTS.out}"`);
+    console.log(`           ${mapped} URLs are query-addressed; a plain static`);
+    console.log(`           server cannot tell them apart and will 404 them.`);
+  } else {
+    console.log(`
+  serve it:  cd "${OPTS.out}" && python -m http.server 8000`);
+  }
 }
 
 main().catch(async (e) => {

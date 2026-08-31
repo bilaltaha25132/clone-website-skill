@@ -94,12 +94,44 @@ node scripts/clone.mjs https://example.com --all --exclude '^/(de|fr|es|zh)/'
 
 ## Viewing the result
 
-Serve the folder — don't open `file://`. Relative paths that climb into
-`_assets/` are blocked on the file protocol:
+Serve the folder - don't open `file://`.
 
 ```bash
-cd example.com-clone && python -m http.server 8000
+node scripts/serve.mjs example.com-clone 8000
 ```
+
+`serve.mjs` is a static server that also honours query strings. Frameworks
+address assets through endpoints that vary only by query
+(`/_next/image?url=logo.png&w=256` vs `&w=1080`), and a conventional static
+server maps one path to one file, so it 404s every one of them. The clone
+records those URLs in `_clone-manifest.json` and this server answers them the
+way the origin did. The run tells you whether it needs this; when nothing is
+query-addressed, `python -m http.server` is fine.
+
+## Does the JavaScript actually run?
+
+Yes - the clone hydrates and stays interactive: menus open, carousels advance,
+animations play. Three things have to line up for that, and all three are the
+default.
+
+**Same-origin assets keep the origin's paths.** A bundler resolves its
+code-split chunks by original URL. Filed under `_assets/<host>/_next/...` the
+runtime never matches them: every script returns 200, nothing errors, and the
+page still never hydrates. Third-party hosts stay namespaced under `_assets/`.
+
+**Those paths are written root-relative.** `_next/...` and `/_next/...` resolve
+to the same file, but a runtime that looks its chunks up by literal path string
+only recognises the second.
+
+**The saved HTML is the server's, not the post-JavaScript DOM.** A snapshot of
+already-hydrated markup is what React compares against its payload - it
+mismatches, never attaches, and the copy looks perfect but responds to nothing.
+`--dom snapshot` forces the snapshot for a site whose scripts cannot run
+offline (content behind an authenticated API); `--dom source` forces the server
+HTML; `auto` keeps the server's HTML whenever it already carries the content.
+
+Measured on `attio.com`: 4161 React fiber nodes in the clone against 4168 live.
+
 
 ## How it works
 
@@ -123,13 +155,15 @@ example.com-clone/
 ├── index.html
 ├── about.html
 ├── blog/post-name.html
+├── _next/static/...              # same-origin assets, at the origin's paths
+├── _clone-manifest.json          # query-addressed URLs -> local files
 └── _assets/
-    ├── example.com/...
-    └── cdn.other-host.com/...
+    └── cdn.other-host.com/...    # third-party, namespaced by host
 ```
 
-Assets are keyed by host, so cross-domain CDN files are preserved without
-collisions. Re-running resumes: existing files are reused, so adding pages
+Same-origin assets mirror the origin's own layout, because that is what the
+site's own JavaScript expects. Third-party assets are keyed by host, so
+cross-domain CDN files are preserved without collisions.
 later doesn't re-download what you already have.
 
 ## What never survives a clone
@@ -138,6 +172,8 @@ later doesn't re-download what you already have.
 - **Search** — usually a hosted API (Algolia, Elastic) needing credentials
 - **Auth, carts, personalisation** — server-side session state
 - **Analytics and cookie consent** — frequently domain-locked
+- **Error reporting** - Sentry and friends POST to an ingest endpoint; those
+  requests fail harmlessly
 - **Streamed video** — HLS/DASH manifests point back at origin CDNs
 - **URLs inside framework payloads** — a page's own JSON blob (Next's RSC
   stream, `__NEXT_DATA__`) is left untouched, because rewriting a URL inside a

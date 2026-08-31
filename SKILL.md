@@ -53,12 +53,22 @@ turns it on.
 
 ## After it runs
 
-Serve the folder rather than opening `file://` — relative paths that climb
-into `_assets/` are blocked on the file protocol:
+Serve the folder rather than opening `file://`:
 
 ```bash
-cd <output-dir> && python -m http.server 8000
+node scripts/serve.mjs <output-dir> 8000
 ```
+
+Use `serve.mjs`, not `python -m http.server`, whenever the run reports
+query-addressed URLs. Framework image endpoints differ only by query string
+(`/_next/image?url=x&w=256`), which a conventional static server cannot tell
+apart - it 404s them all. The clone writes `_clone-manifest.json` and
+`serve.mjs` resolves against it.
+
+The clone hydrates and stays interactive by default. If a site's scripts
+cannot run offline - content behind an authenticated API - `--dom snapshot`
+saves the post-JavaScript DOM instead, which shows the content but leaves the
+page inert.
 
 ## What never survives a clone
 
