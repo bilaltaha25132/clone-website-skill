@@ -68,12 +68,17 @@ node scripts/clone.mjs <url> [options]
   --depth N            link-following depth (default 3)
   --out DIR            output folder (default ./<hostname>-clone)
   --engine E           auto | static | render (default auto)
+  --dom MODE           source | snapshot | auto (default auto)
+                       source   = server HTML; hydrates like the live site
+                       snapshot = post-JS DOM; shows content but stays inert
   --include RE         only crawl paths matching this regex
   --exclude RE         skip paths matching this regex
   --delay MS           politeness delay between pages (default 300)
   --max-asset-mb N     skip assets larger than this (default 50)
   --ignore-robots      ignore robots.txt (default: honoured)
   --no-resume          re-download instead of reusing existing files
+  --port N             port for the built-in server (default 8100)
+  --no-serve           just write the files; do not start the server
 ```
 
 ### Examples
@@ -94,10 +99,18 @@ node scripts/clone.mjs https://example.com --all --exclude '^/(de|fr|es|zh)/'
 
 ## Viewing the result
 
-Serve the folder - don't open `file://`.
+When a run finishes it starts a server and prints the URL:
+
+```
+open it:   http://localhost:8100/
+```
+
+That is the whole flow - clone, then open the link. `--port N` moves it,
+`--no-serve` skips it and just writes the files. To serve a clone you made
+earlier:
 
 ```bash
-node scripts/serve.mjs example.com-clone 8000
+node scripts/serve.mjs example.com-clone        # also defaults to 8100
 ```
 
 `serve.mjs` is a static server that also honours query strings. Frameworks

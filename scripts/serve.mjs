@@ -13,8 +13,7 @@ import fs from 'node:fs/promises';
 import { createReadStream, existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 
-const root = path.resolve(process.argv[2] ?? '.');
-const port = Number(process.argv[3] ?? 8000);
+export const DEFAULT_PORT = 8100;
 
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8',
@@ -28,24 +27,19 @@ const MIME = {
   '.txt': 'text/plain; charset=utf-8', '.xml': 'application/xml',
 };
 
-let manifest = {};
-const manifestPath = path.join(root, '_clone-manifest.json');
-if (existsSync(manifestPath)) {
-  manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
-}
 
 /** Keep resolved paths inside the clone: a request may not climb out with ../ */
-function within(rel) {
+function within(root, rel) {
   const abs = path.resolve(root, '.' + path.posix.resolve('/', rel));
   return abs === root || abs.startsWith(root + path.sep) ? abs : null;
 }
 
 const isFile = (p) => { try { return statSync(p).isFile(); } catch { return false; } };
 
-function locate(pathname, search) {
+function locate(root, manifest, pathname, search) {
   const exact = manifest[pathname + search];               // query-addressed
-  if (exact) return within(exact);
-  const direct = within(decodeURIComponent(pathname));
+  if (exact) return within(root, exact);
+  const direct = within(root, decodeURIComponent(pathname));
   if (direct && isFile(direct)) return direct;
   if (direct) {
     for (const c of [direct + '.html', path.join(direct, 'index.html')]) {
@@ -55,21 +49,48 @@ function locate(pathname, search) {
   return null;
 }
 
-http.createServer((req, res) => {
-  const u = new URL(req.url, 'http://localhost');
-  const file = locate(u.pathname === '/' ? '/index.html' : u.pathname, u.search);
-  if (!file) {
-    res.writeHead(404, { 'content-type': 'text/plain' });
-    return res.end('404 ' + u.pathname + u.search);
-  }
-  res.writeHead(200, {
-    'content-type': MIME[path.extname(file).toLowerCase()] ?? 'application/octet-stream',
-    'cache-control': 'no-store',
+/**
+ * Start the server. Resolves once listening, or rejects with a readable
+ * message when the port is taken -- the common case being a previous clone
+ * still serving on it.
+ */
+export async function startServer(dir, port = DEFAULT_PORT) {
+  const root = path.resolve(dir);
+  let manifest = {};
+  const mf = path.join(root, '_clone-manifest.json');
+  if (existsSync(mf)) manifest = JSON.parse(await fs.readFile(mf, 'utf8'));
+
+  const server = http.createServer((req, res) => {
+    const u = new URL(req.url, 'http://localhost');
+    const file = locate(root, manifest, u.pathname === '/' ? '/index.html' : u.pathname, u.search);
+    if (!file) {
+      res.writeHead(404, { 'content-type': 'text/plain' });
+      return res.end('404 ' + u.pathname + u.search);
+    }
+    res.writeHead(200, {
+      'content-type': MIME[path.extname(file).toLowerCase()] ?? 'application/octet-stream',
+      'cache-control': 'no-store',
+    });
+    createReadStream(file).pipe(res);
   });
-  createReadStream(file).pipe(res);
-}).listen(port, () => {
-  const n = Object.keys(manifest).length;
-  console.log(`serving ${root}`);
+
+  await new Promise((resolve, reject) => {
+    server.once('error', (e) => reject(
+      e.code === 'EADDRINUSE'
+        ? new Error(`port ${port} is already in use - stop whatever holds it, `
+                  + `or pass --port <n>`)
+        : e,
+    ));
+    server.listen(port, resolve);
+  });
+  return { server, port, mapped: Object.keys(manifest).length };
+}
+
+// Run standalone: node serve.mjs <dir> [port]
+if (process.argv[1] && import.meta.url.endsWith(path.basename(process.argv[1]))) {
+  const { port, mapped } = await startServer(process.argv[2] ?? '.',
+    Number(process.argv[3] ?? DEFAULT_PORT));
+  console.log(`serving ${path.resolve(process.argv[2] ?? '.')}`);
   console.log(`  http://localhost:${port}/`);
-  console.log(`  ${n} query-addressed URL${n === 1 ? '' : 's'} from the manifest`);
-});
+  console.log(`  ${mapped} query-addressed URL${mapped === 1 ? '' : 's'} from the manifest`);
+}

@@ -53,10 +53,13 @@ turns it on.
 
 ## After it runs
 
-Serve the folder rather than opening `file://`:
+The run serves the clone itself when it finishes, on **port 8100**, and prints
+the URL. Hand that link to the user rather than telling them to start a server.
+`--port N` changes it; `--no-serve` writes the files and returns immediately -
+use that when you need the command to exit, then start the server separately:
 
 ```bash
-node scripts/serve.mjs <output-dir> 8000
+node scripts/serve.mjs <output-dir>      # defaults to 8100
 ```
 
 Use `serve.mjs`, not `python -m http.server`, whenever the run reports

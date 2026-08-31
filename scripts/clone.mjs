@@ -21,7 +21,8 @@ const argv = process.argv.slice(2);
 if (!argv.length || argv[0].startsWith('-')) {
   console.error('usage: node clone.mjs <url> [--pages N|--all] [--out DIR] [--engine auto|static|render]');
   console.error('       [--depth N] [--include RE] [--exclude RE] [--delay MS] [--concurrency N]');
-  console.error('       [--ignore-robots] [--no-resume] [--max-asset-mb N]');
+  console.error('       [--ignore-robots] [--no-resume] [--max-asset-mb N] [--dom source|snapshot]');
+  console.error('       [--port N] [--no-serve]   (serves the clone on :8100 when done)');
   process.exit(1);
 }
 const flag = (name, dflt) => {
@@ -38,6 +39,8 @@ const OPTS = {
   depth: Number(flag('depth', 3)),
   engine: String(flag('engine', 'auto')),
   dom: String(flag('dom', 'auto')),
+  port: Number(flag('port', 8100)),
+  serve: !has('no-serve'),
   delay: Number(flag('delay', 300)),
   include: flag('include', null) ? new RegExp(String(flag('include'))) : null,
   exclude: flag('exclude', null) ? new RegExp(String(flag('exclude'))) : null,
@@ -610,15 +613,25 @@ async function main() {
   console.log(`assets  ${stats.assets} saved, ${stats.reused} reused, ${stats.failed} failed`);
   console.log(`size    ${(stats.bytes / 1048576).toFixed(1)} MB`);
   console.log(`output  ${OPTS.out}`);
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  if (mapped) {
+  if (!OPTS.serve) {
+    const here = path.dirname(fileURLToPath(import.meta.url));
     console.log(`
-  serve it:  node "${path.join(here, 'serve.mjs')}" "${OPTS.out}"`);
-    console.log(`           ${mapped} URLs are query-addressed; a plain static`);
-    console.log(`           server cannot tell them apart and will 404 them.`);
-  } else {
+serve it:  node "${path.join(here, 'serve.mjs')}" "${OPTS.out}"`);
+    return;
+  }
+
+  try {
+    const { startServer } = await import('./serve.mjs');
+    const { port, mapped } = await startServer(OPTS.out, OPTS.port);
     console.log(`
-  serve it:  cd "${OPTS.out}" && python -m http.server 8000`);
+open it:   http://localhost:${port}/`);
+    if (mapped) console.log(`           ${mapped} query-addressed URLs served from the manifest`);
+    console.log('           Ctrl+C to stop');
+  } catch (e) {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    console.log(`
+files are written, but the server did not start: ${e.message}`);
+    console.log(`start it yourself:  node "${path.join(here, 'serve.mjs')}" "${OPTS.out}"`);
   }
 }
 
